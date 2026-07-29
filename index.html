@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Level — UK Level Crossing Train Times</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root {
+    --bg: #f5f6f8; --card: #ffffff; --ink: #16181d; --muted: #6b7280;
+    --accent: #c8102e; --accent-ink: #ffffff; --line: #e5e7eb;
+    --ok: #047857; --warn: #b45309; --bad: #b91c1c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #101216; --card: #1a1d23; --ink: #eceef2; --muted: #9aa1ad;
+      --line: #2a2e36; --ok: #34d399; --warn: #fbbf24; --bad: #f87171;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--ink);
+    display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+    background: var(--card); border-bottom: 1px solid var(--line); z-index: 1200;
+  }
+  header .logo { font-weight: 800; letter-spacing: -.02em; white-space: nowrap; }
+  header .logo span { color: var(--accent); }
+  #searchWrap { position: relative; flex: 1; min-width: 0; }
+  #searchBox {
+    width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--bg); color: var(--ink); font-size: 15px;
+  }
+  #searchResults {
+    position: absolute; top: 100%; left: 0; right: 0; background: var(--card);
+    border: 1px solid var(--line); border-radius: 8px; margin-top: 4px;
+    max-height: 40vh; overflow: auto; z-index: 1300; box-shadow: 0 8px 24px rgba(0,0,0,.18);
+  }
+  #searchResults:empty { display: none; }
+  #searchResults button {
+    display: block; width: 100%; text-align: left; padding: 9px 12px;
+    background: none; border: 0; border-bottom: 1px solid var(--line);
+    color: var(--ink); font-size: 14px; cursor: pointer;
+  }
+  #searchResults button:last-child { border-bottom: 0; }
+  #searchResults button:hover { background: var(--bg); }
+  .iconBtn {
+    flex: 0 0 auto; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--bg); color: var(--ink); font-size: 15px; cursor: pointer;
+  }
+  main { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  #map { flex: 1; min-height: 32vh; z-index: 1; }
+  #panel {
+    flex: 0 0 auto; max-height: 52vh; overflow-y: auto; background: var(--card);
+    border-top: 1px solid var(--line); padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
+  }
+  @media (min-width: 900px) {
+    main { flex-direction: row; }
+    #map { min-height: 0; height: auto; }
+    #panel { flex: 0 0 430px; max-height: none; border-top: 0; border-left: 1px solid var(--line); }
+  }
+  .hint { color: var(--muted); font-size: 13.5px; }
+  .crossTitle { font-size: 17px; font-weight: 700; margin: 2px 0 1px; }
+  .crossSub { color: var(--muted); font-size: 13px; margin-bottom: 8px; }
+  .train {
+    border: 1px solid var(--line); border-radius: 10px; padding: 9px 11px; margin: 8px 0;
+    display: flex; gap: 10px; align-items: center;
+  }
+  .train .when { flex: 0 0 74px; text-align: center; }
+  .train .when .big { font-size: 19px; font-weight: 800; letter-spacing: -.02em; }
+  .train .when .small { font-size: 12px; color: var(--muted); }
+  .train .info { flex: 1; min-width: 0; }
+  .train .route { font-weight: 600; font-size: 14.5px; }
+  .train .meta { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+  .badge {
+    display: inline-block; font-size: 11px; font-weight: 700; padding: 1px 7px;
+    border-radius: 99px; margin-left: 6px; vertical-align: 1px;
+  }
+  .b-ok   { background: color-mix(in srgb, var(--ok) 15%, transparent); color: var(--ok); }
+  .b-warn { background: color-mix(in srgb, var(--warn) 15%, transparent); color: var(--warn); }
+  .b-bad  { background: color-mix(in srgb, var(--bad) 15%, transparent); color: var(--bad); }
+  .imminent { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
+  .toolbar .spacer { flex: 1; }
+  .pill {
+    font-size: 12.5px; border: 1px solid var(--line); border-radius: 99px;
+    background: var(--bg); color: var(--ink); padding: 4px 11px; cursor: pointer;
+  }
+  .caveat {
+    margin-top: 10px; padding: 8px 10px; border-radius: 8px; font-size: 12px;
+    background: color-mix(in srgb, var(--warn) 10%, transparent); color: var(--muted);
+  }
+  .caveat strong { color: var(--warn); }
+  .spin {
+    display: inline-block; width: 14px; height: 14px; border: 2px solid var(--muted);
+    border-top-color: transparent; border-radius: 50%; animation: sp 0.8s linear infinite;
+    vertical-align: -2px; margin-right: 6px;
+  }
+  @keyframes sp { to { transform: rotate(360deg); } }
+  .xing-icon {
+    background: var(--accent); color: #fff; border-radius: 50%; border: 2px solid #fff;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 800; font-size: 12px; box-shadow: 0 1px 4px rgba(0,0,0,.4);
+  }
+  .xing-icon.sel { background: #1d4ed8; }
+  #areaBtn {
+    position: absolute; left: 50%; transform: translateX(-50%); top: 10px; z-index: 1000;
+    border: 0; border-radius: 99px; padding: 7px 14px; font-size: 13px; font-weight: 600;
+    background: var(--card); color: var(--ink); box-shadow: 0 2px 8px rgba(0,0,0,.25); cursor: pointer;
+  }
+  .mapwrap { position: relative; flex: 1; display: flex; min-height: 0; }
+  a { color: inherit; }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">Level<span>X</span></div>
+  <div id="searchWrap">
+    <input id="searchBox" type="search" placeholder="Search a town, road or postcode…" autocomplete="off">
+    <div id="searchResults"></div>
+  </div>
+  <button class="iconBtn" id="locBtn" title="Use my location">📍</button>
+</header>
+<main>
+  <div class="mapwrap">
+    <div id="map"></div>
+    <button id="areaBtn" hidden>Find crossings in this area</button>
+  </div>
+  <div id="panel">
+    <div class="hint" id="panelDefault">
+      <p><strong>Find out when trains pass a level crossing.</strong></p>
+      <p>Search for a place or tap 📍, then choose a level crossing on the map.
+      Live train data is matched to the crossing and each train's passing time is
+      estimated from its timings at the stations either side.</p>
+      <p id="bootStatus"><span class="spin"></span>Loading station database…</p>
+    </div>
+    <div id="panelContent"></div>
+  </div>
+</main>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+'use strict';
+const HUXLEY = 'https://huxley2.azurewebsites.net';
+const OVERPASS_ENDPOINTS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+];
+const STATIONS_URL = 'https://raw.githubusercontent.com/davwheat/uk-railway-stations/main/stations.json';
+
+let stations = [];           // {stationName, lat, long, crsCode}
+let map, xingLayer, selMarker = null;
+let crossings = new Map();   // id -> {id, lat, lon, name, barrier, road}
+let selected = null;         // crossing object
+let refreshTimer = null;
+let fetchSeq = 0;
+
+// ---------- helpers ----------
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function havKm(lat1, lon1, lat2, lon2) {
+  const R = 6371, toR = Math.PI / 180;
+  const dLat = (lat2 - lat1) * toR, dLon = (lon2 - lon1) * toR;
+  const a = Math.sin(dLat/2)**2 + Math.cos(lat1*toR) * Math.cos(lat2*toR) * Math.sin(dLon/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+// Current time in the UK as minutes since midnight (trains run on Europe/London time).
+function ukNowMins() {
+  const p = new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/London', hour: 'numeric', minute: 'numeric', hourCycle: 'h23' }).formatToParts(new Date());
+  const g = t => +p.find(x => x.type === t).value;
+  return g('hour') * 60 + g('minute');
+}
+
+// "14:23" -> minutes since midnight, unwrapped to be near `ref` (handles midnight rollover)
+function parseHM(s, ref) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(s || '').trim());
+  if (!m) return null;
+  let t = (+m[1]) * 60 + (+m[2]);
+  while (t < ref - 720) t += 1440;
+  while (t > ref + 720) t -= 1440;
+  return t;
+}
+
+function fmtHM(mins) {
+  const m = ((Math.round(mins) % 1440) + 1440) % 1440;
+  return String(Math.floor(m/60)).padStart(2,'0') + ':' + String(m%60).padStart(2,'0');
+}
+
+const BARRIER_LABELS = {
+  full: 'Full barriers', double_half: 'Half barriers', half: 'Half barriers',
+  no: 'No barriers (open crossing)', gate: 'Gated crossing', gates: 'Gated crossing',
+  lift_gate: 'Lifting gates',
+};
+
+// ---------- boot ----------
+async function loadStations() {
+  try {
+    const cached = localStorage.getItem('levelx_stations');
+    if (cached) { stations = JSON.parse(cached); }
+  } catch (e) {}
+  if (!stations.length) {
+    const r = await fetch(STATIONS_URL);
+    if (!r.ok) throw new Error('station list HTTP ' + r.status);
+    stations = await r.json();
+    try { localStorage.setItem('levelx_stations', JSON.stringify(stations)); } catch (e) {}
+  }
+  $('bootStatus').innerHTML = stations.length + ' stations loaded. Search for a place to begin.';
+}
+
+function initMap() {
+  map = L.map('map', { zoomControl: true }).setView([52.6, -1.5], 6);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+  }).addTo(map);
+  xingLayer = L.layerGroup().addTo(map);
+  map.on('moveend', () => {
+    if (map.getZoom() >= 10) $('areaBtn').hidden = false;
+  });
+}
+
+// ---------- crossings via Overpass ----------
+async function findCrossings(lat, lon, radiusM) {
+  $('areaBtn').textContent = 'Searching…';
+  const q = `[out:json][timeout:25];
+node["railway"="level_crossing"](around:${Math.round(radiusM)},${lat},${lon});
+out body;
+way(bn)["highway"];
+out body;`;
+  let data = null, lastErr = null;
+  for (const ep of OVERPASS_ENDPOINTS) {
+    try {
+      const r = await fetch(ep, { method: 'POST', body: 'data=' + encodeURIComponent(q),
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        signal: AbortSignal.timeout(25000) });
+      if (!r.ok) { lastErr = new Error('Overpass HTTP ' + r.status); continue; }
+      data = await r.json();
+      break;
+    } catch (e) { lastErr = e; }
+  }
+  if (!data) throw (lastErr || new Error('Overpass unreachable'));
+  const nodes = data.elements.filter(e => e.type === 'node');
+  const ways = data.elements.filter(e => e.type === 'way');
+  crossings.clear();
+  xingLayer.clearLayers();
+  // OSM maps one node per track — merge nodes within ~150 m into a single crossing
+  const merged = [];
+  for (const n of nodes) {
+    const twin = merged.find(m => havKm(m.lat, m.lon, n.lat, n.lon) < 0.15);
+    if (twin) { if (!twin.tags?.name && n.tags?.name) twin.tags = n.tags; continue; }
+    merged.push(n);
+  }
+  for (const n of merged) {
+    const road = ways.find(w => w.nodes && w.nodes.includes(n.id) && w.tags && (w.tags.name || w.tags.ref));
+    const tags = n.tags || {};
+    const name = tags.name || (road ? ((road.tags.name || road.tags.ref) + ' level crossing') : 'Level crossing');
+    const c = { id: n.id, lat: n.lat, lon: n.lon, name,
+      barrier: BARRIER_LABELS[tags['crossing:barrier']] || null };
+    crossings.set(n.id, c);
+    const mk = L.marker([n.lat, n.lon], { icon: xingIcon(false) }).addTo(xingLayer);
+    mk.on('click', () => selectCrossing(c, mk));
+    mk.bindTooltip(esc(name));
+    c._marker = mk;
+  }
+  $('areaBtn').textContent = 'Find crossings in this area';
+  // if none are visible, widen the view so the user can see what was found
+  if (merged.length && !merged.some(n => map.getBounds().contains([n.lat, n.lon]))) {
+    map.fitBounds(L.latLngBounds(merged.map(n => [n.lat, n.lon])).pad(0.2));
+  }
+  return merged.length;
+}
+
+function xingIcon(sel) {
+  return L.divIcon({ className: '', iconSize: [22, 22], iconAnchor: [11, 11],
+    html: `<div class="xing-icon${sel ? ' sel' : ''}" style="width:22px;height:22px">✕</div>` });
+}
+
+// ---------- train pass estimation ----------
+function nearestStations(lat, lon, n) {
+  return stations
+    .map(s => ({ ...s, d: havKm(lat, lon, s.lat, s.long) }))
+    .sort((a, b) => a.d - b.d)
+    .slice(0, n);
+}
+
+function stationByCrs(crs) {
+  return stations.find(s => s.crsCode === crs);
+}
+
+// Does crossing X lie between points A and B along a (roughly straight) railway?
+function betweenness(ax, ay, bx, by, xlat, xlon) {
+  const dA = havKm(ax, ay, xlat, xlon);
+  const dB = havKm(xlat, xlon, bx, by);
+  const dAB = havKm(ax, ay, bx, by);
+  if (dAB < 0.25) return null;
+  const detour = dA + dB - dAB;
+  if (detour > 0.12 * dAB + 0.35) return null;  // not on this segment
+  return { frac: dA / (dA + dB), dAB, detour };
+}
+
+function timeOf(pt, nowM) {
+  // pt: {st, et} or service head {std, etd}. Returns {mins, delayed, cancelled}
+  const sched = pt.st ?? pt.std;
+  const est = pt.et ?? pt.etd;
+  if (/cancel/i.test(est || '') || pt.isCancelled) return { cancelled: true };
+  const sm = parseHM(sched, nowM);
+  const em = parseHM(est, nowM);
+  if (em != null) return { mins: em, delayed: sm != null && em > sm + 1 };
+  if (/delay/i.test(est || '')) return { mins: sm, delayed: true, uncertain: true };
+  return { mins: sm, delayed: false };
+}
+
+async function fetchBoard(crs) {
+  const r = await fetch(`${HUXLEY}/departures/${crs}/15?expand=true`, { signal: AbortSignal.timeout(20000) });
+  if (!r.ok) throw new Error(`${crs} board HTTP ${r.status}`);
+  return r.json();
+}
+
+function extractPasses(board, boardCrs, xing, nowM) {
+  const out = [];
+  const bSt = stationByCrs(boardCrs);
+  if (!bSt || !board || !board.trainServices) return out;
+  for (const svc of board.trainServices) {
+    if (svc.isCancelled) continue;
+    // chain: board station then each subsequent calling point, with coords + times
+    const chain = [{ crs: boardCrs, name: bSt.stationName, lat: bSt.lat, lon: bSt.long,
+                     t: timeOf({ std: svc.std, etd: svc.etd }, nowM), tRaw: svc.std }];
+    const groups = svc.subsequentCallingPoints || [];
+    for (const g of groups.slice(0, 1)) {          // primary route (ignore divided portions)
+      for (const cp of (g.callingPoint || [])) {
+        const st = stationByCrs(cp.crs);
+        if (!st) continue;
+        chain.push({ crs: cp.crs, name: cp.locationName, lat: st.lat, lon: st.long,
+                     t: timeOf(cp, nowM), tRaw: cp.st });
+      }
+    }
+    for (let i = 0; i + 1 < chain.length; i++) {
+      const A = chain[i], B = chain[i + 1];
+      if (A.t.cancelled || B.t.cancelled || A.t.mins == null || B.t.mins == null) continue;
+      const bw = betweenness(A.lat, A.lon, B.lat, B.lon, xing.lat, xing.lon);
+      if (!bw) continue;
+      let dt = B.t.mins - A.t.mins;
+      if (dt < 0) dt += 1440;
+      if (dt > 90) continue;                        // implausible segment
+      const pass = A.t.mins + bw.frac * dt;
+      // key must be identical when the same train is seen from different boards:
+      // Darwin service IDs are board-specific, but operator + destination + the
+      // scheduled time at the final calling point are stable across boards.
+      const last = chain[chain.length - 1];
+      out.push({
+        id: `${svc.operatorCode}|${last.crs}|${parseHM(last.tRaw, nowM) ?? ''}`,
+        pass, segKm: bw.dAB, detour: bw.detour,
+        from: A.name, to: B.name,
+        origin: (svc.origin || []).map(o => o.locationName).join(' & '),
+        dest: (svc.destination || []).map(d => d.locationName).join(' & '),
+        operator: svc.operator,
+        delayed: A.t.delayed || B.t.delayed,
+        uncertain: A.t.uncertain || B.t.uncertain,
+      });
+      break;                                        // one pass per service per board
+    }
+  }
+  return out;
+}
+
+async function computePasses(xing) {
+  const near = nearestStations(xing.lat, xing.lon, 5).filter(s => s.d < 40);
+  const nowM = ukNowMins();
+  const results = await Promise.allSettled(near.map(s => fetchBoard(s.crsCode)));
+  let passes = [];
+  let okBoards = 0;
+  results.forEach((res, i) => {
+    if (res.status === 'fulfilled') { okBoards++; passes = passes.concat(extractPasses(res.value, near[i].crsCode, xing, nowM)); }
+  });
+  // dedupe same service seen from several boards — keep tightest bracketing segment
+  const best = new Map();
+  for (const p of passes) {
+    const cur = best.get(p.id);
+    if (!cur || p.segKm < cur.segKm) best.set(p.id, p);
+  }
+  const list = [...best.values()]
+    .filter(p => p.pass >= nowM - 3)
+    .sort((a, b) => a.pass - b.pass);
+  return { list, nowM, boards: okBoards, boardsTried: near.length, stations: near };
+}
+
+// ---------- UI ----------
+async function selectCrossing(c, marker) {
+  if (selMarker) selMarker.setIcon(xingIcon(false));
+  marker.setIcon(xingIcon(true));
+  selMarker = marker;
+  selected = c;
+  $('panelDefault').hidden = true;
+  renderPanelShell(c, `<p class="hint"><span class="spin"></span>Fetching live departures near this crossing…</p>`);
+  await refreshSelected();
+  clearInterval(refreshTimer);
+  refreshTimer = setInterval(refreshSelected, 60000);
+}
+
+function renderPanelShell(c, inner) {
+  $('panelContent').innerHTML = `
+    <div class="toolbar">
+      <div style="min-width:0">
+        <div class="crossTitle">${esc(c.name)}</div>
+        <div class="crossSub">${c.barrier ? esc(c.barrier) + ' · ' : ''}${c.lat.toFixed(5)}, ${c.lon.toFixed(5)}</div>
+      </div>
+      <div class="spacer"></div>
+      <button class="pill" onclick="refreshSelected()">↻ Refresh</button>
+    </div>
+    <div id="trainList">${inner}</div>`;
+}
+
+async function refreshSelected() {
+  if (!selected) return;
+  const c = selected, seq = ++fetchSeq;
+  try {
+    const { list, nowM, boards, boardsTried, stations: near } = await computePasses(c);
+    if (seq !== fetchSeq || selected !== c) return;   // stale response
+    let html = '';
+    if (!boards) {
+      html = `<p class="hint">Couldn't reach the live departures service. Check your connection and try again.</p>`;
+    } else if (!list.length) {
+      html = `<p class="hint">No trains found passing this crossing in the next couple of hours
+        (checked live boards at ${near.slice(0, boards).map(s => esc(s.stationName)).join(', ')}).
+        Quiet lines, freight-only lines and heritage railways won't show scheduled passenger services.</p>`;
+    } else {
+      html = list.map(p => {
+        const inMin = Math.round(p.pass - nowM);
+        const imminent = inMin <= 3;
+        const whenBig = inMin <= 0 ? 'now' : (inMin < 60 ? `${inMin} min` : fmtHM(p.pass));
+        let badge = '';
+        if (p.uncertain) badge = `<span class="badge b-bad">delayed</span>`;
+        else if (p.delayed) badge = `<span class="badge b-warn">running late</span>`;
+        else badge = `<span class="badge b-ok">on time</span>`;
+        return `<div class="train${imminent ? ' imminent' : ''}">
+          <div class="when"><div class="big">${esc(whenBig)}</div><div class="small">${p.uncertain ? '~' : ''}${fmtHM(p.pass)}</div></div>
+          <div class="info">
+            <div class="route">${esc(p.origin)} → ${esc(p.dest)}${badge}</div>
+            <div class="meta">${esc(p.operator)} · passes between ${esc(p.from)} and ${esc(p.to)}</div>
+          </div>
+        </div>`;
+      }).join('');
+    }
+    html += `<div class="caveat"><strong>Estimates only — never rely on this for safety.</strong>
+      Times are interpolated from live timings at nearby stations, so they can be a few minutes out,
+      and services that don't call at any nearby station (including freight) may be missing.
+      Always obey barriers, lights and signage at the crossing.
+      <br>Updated ${fmtHM(nowM)} · live boards: ${near.slice(0, 5).filter((s,i)=>i<boardsTried).map(s => esc(s.crsCode)).join(', ')}</div>`;
+    const el = $('trainList');
+    if (el) el.innerHTML = html;
+  } catch (e) {
+    if (seq !== fetchSeq) return;
+    const el = $('trainList');
+    if (el) el.innerHTML = `<p class="hint">Something went wrong fetching train data (${esc(e.message)}). Tap ↻ Refresh to retry.</p>`;
+  }
+}
+
+// ---------- search & locate ----------
+let searchDebounce = null;
+$('searchBox').addEventListener('input', () => {
+  clearTimeout(searchDebounce);
+  const q = $('searchBox').value.trim();
+  if (q.length < 3) { $('searchResults').innerHTML = ''; return; }
+  searchDebounce = setTimeout(() => doSearch(q), 450);
+});
+$('searchBox').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { clearTimeout(searchDebounce); doSearch($('searchBox').value.trim()); }
+});
+
+async function doSearch(q) {
+  if (!q) return;
+  try {
+    const r = await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&countrycodes=gb&limit=6&q=${encodeURIComponent(q)}`);
+    let results = await r.json();
+    const seen = new Set();
+    results = results.filter(x => !seen.has(x.display_name) && seen.add(x.display_name));
+    $('searchResults').innerHTML = results.length
+      ? results.map((res, i) => `<button data-i="${i}">${esc(res.display_name)}</button>`).join('')
+      : `<button disabled>No places found</button>`;
+    [...$('searchResults').querySelectorAll('button[data-i]')].forEach(btn => {
+      btn.onclick = () => {
+        const res = results[+btn.dataset.i];
+        $('searchResults').innerHTML = '';
+        $('searchBox').blur();
+        goTo(+res.lat, +res.lon);
+      };
+    });
+  } catch (e) {
+    $('searchResults').innerHTML = `<button disabled>Search failed — try again</button>`;
+  }
+}
+
+$('locBtn').onclick = () => {
+  if (!navigator.geolocation) return alert('Geolocation not available in this browser.');
+  $('locBtn').textContent = '…';
+  navigator.geolocation.getCurrentPosition(
+    pos => { $('locBtn').textContent = '📍'; goTo(pos.coords.latitude, pos.coords.longitude); },
+    () => { $('locBtn').textContent = '📍'; alert('Could not get your location — try searching instead.'); },
+    { enableHighAccuracy: true, timeout: 10000 });
+};
+
+async function goTo(lat, lon) {
+  map.setView([lat, lon], 13);
+  await searchArea();
+}
+
+async function searchArea() {
+  const c = map.getCenter();
+  const b = map.getBounds();
+  const radius = Math.min(12000, Math.max(5000, havKm(c.lat, c.lng, b.getNorth(), b.getEast()) * 1000));
+  try {
+    const n = await findCrossings(c.lat, c.lng, radius);
+    if (!selected) {
+      $('panelDefault').hidden = false;
+      $('bootStatus').innerHTML = n
+        ? `<strong>${n} level crossing${n === 1 ? '' : 's'}</strong> found — tap one on the map.`
+        : 'No level crossings mapped in this area. Try zooming out or another location.';
+    }
+  } catch (e) {
+    $('areaBtn').textContent = 'Find crossings in this area';
+    if (!selected) $('bootStatus').innerHTML = 'Crossing search failed (' + esc(e.message) + '). Try again shortly.';
+  }
+}
+$('areaBtn').onclick = searchArea;
+
+initMap();
+loadStations().catch(e => { $('bootStatus').textContent = 'Failed to load station list: ' + e.message; });
+</script>
+</body>
+</html>
