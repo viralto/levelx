@@ -229,9 +229,11 @@ function initMap() {
 async function findCrossings(lat, lon, radiusM) {
   $('areaBtn').textContent = 'Searching…';
   const q = `[out:json][timeout:25];
-node["railway"="level_crossing"](around:${Math.round(radiusM)},${lat},${lon});
+node["railway"="level_crossing"](around:${Math.round(radiusM)},${lat},${lon})->.x;
+.x out body;
+way(bn.x)["highway"];
 out body;
-way(bn)["highway"];
+way(bn.x)["railway"];
 out body;`;
   let data = null, lastErr = null;
   for (const ep of OVERPASS_ENDPOINTS) {
@@ -247,17 +249,26 @@ out body;`;
   if (!data) throw (lastErr || new Error('Overpass unreachable'));
   const nodes = data.elements.filter(e => e.type === 'node');
   const ways = data.elements.filter(e => e.type === 'way');
+  const roadWays = ways.filter(w => w.tags && w.tags.highway);
+  const railWays = ways.filter(w => w.tags && w.tags.railway);
+  // Model/miniature railways use the same level_crossing node as the real network —
+  // keep a crossing only if some parent railway way is a full-size type (or unknown).
+  const REAL_RAIL = new Set(['rail', 'light_rail', 'narrow_gauge', 'tram', 'subway', 'preserved']);
+  const realNodes = nodes.filter(n => {
+    const parents = railWays.filter(w => w.nodes && w.nodes.includes(n.id));
+    return !parents.length || parents.some(w => REAL_RAIL.has(w.tags.railway));
+  });
   crossings.clear();
   xingLayer.clearLayers();
   // OSM maps one node per track — merge nodes within ~150 m into a single crossing
   const merged = [];
-  for (const n of nodes) {
+  for (const n of realNodes) {
     const twin = merged.find(m => havKm(m.lat, m.lon, n.lat, n.lon) < 0.15);
     if (twin) { if (!twin.tags?.name && n.tags?.name) twin.tags = n.tags; continue; }
     merged.push(n);
   }
   for (const n of merged) {
-    const road = ways.find(w => w.nodes && w.nodes.includes(n.id) && w.tags && (w.tags.name || w.tags.ref));
+    const road = roadWays.find(w => w.nodes && w.nodes.includes(n.id) && (w.tags.name || w.tags.ref));
     const tags = n.tags || {};
     const name = tags.name || (road ? ((road.tags.name || road.tags.ref) + ' level crossing') : 'Level crossing');
     const c = { id: n.id, lat: n.lat, lon: n.lon, name,
