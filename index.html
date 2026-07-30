@@ -90,6 +90,23 @@
     font-size: 12.5px; border: 1px solid var(--line); border-radius: 99px;
     background: var(--bg); color: var(--ink); padding: 4px 11px; cursor: pointer;
   }
+  .banner {
+    border-radius: 10px; padding: 10px 12px; margin: 6px 0 10px;
+    font-weight: 700; font-size: 14.5px;
+  }
+  .banner .sub { font-weight: 400; font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+  .st-open   { background: color-mix(in srgb, var(--ok) 12%, transparent);   color: var(--ok); }
+  .st-soon   { background: color-mix(in srgb, var(--warn) 14%, transparent); color: var(--warn); }
+  .st-closed { background: color-mix(in srgb, var(--bad) 14%, transparent);  color: var(--bad); }
+  .st-none   { background: var(--bg); color: var(--muted); }
+  .closures { margin: 0 0 4px; }
+  .closures h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 10px 0 4px; }
+  .closure {
+    display: flex; gap: 10px; align-items: baseline; padding: 5px 2px;
+    border-bottom: 1px dashed var(--line); font-size: 14px;
+  }
+  .closure .range { font-weight: 700; font-variant-numeric: tabular-nums; }
+  .closure .dur { color: var(--muted); font-size: 12.5px; }
   .caveat {
     margin-top: 10px; padding: 8px 10px; border-radius: 8px; font-size: 12px;
     background: color-mix(in srgb, var(--warn) 10%, transparent); color: var(--muted);
@@ -192,11 +209,29 @@ function fmtHM(mins) {
   return String(Math.floor(m/60)).padStart(2,'0') + ':' + String(m%60).padStart(2,'0');
 }
 
-const BARRIER_LABELS = {
-  full: 'Full barriers', double_half: 'Half barriers', half: 'Half barriers',
-  no: 'No barriers (open crossing)', gate: 'Gated crossing', gates: 'Gated crossing',
-  lift_gate: 'Lifting gates',
-};
+// Crossing behaviour profiles. Timing constants are typical published UK figures:
+// AHB sequence gives >=27 s warning (amber 3 s, reds ~7 s, descent ~7 s) and rises
+// seconds after the train clears; MCB/CCTV barriers are proved clear before the
+// protecting signal shows green, so they fall ~1.5-3 min ahead. All in seconds.
+//   preL: warning lights before pass · preD: barriers down before pass ·
+//   post: reopen after pass · gap: closures closer than this stay merged
+function crossingProfile(c) {
+  const b = c.rawBarrier, l = c.rawLight;
+  if (b === 'half')
+    return { type: 'AHB', name: 'Automatic half barriers', preL: 35, preD: 22, post: 12, gap: 40, hasBarrier: true };
+  if (b === 'full' || b === 'double_half')
+    return { type: 'MCB', name: b === 'full' ? 'Full barriers' : 'Full barriers (double half)',
+             preL: 140, preD: 120, post: 15, gap: 90, hasBarrier: true };
+  if (b === 'no') {
+    if (l === 'no') return { type: 'NONE', name: 'Open crossing — no barriers or lights mapped', hasBarrier: false };
+    return { type: 'AOC', name: 'Open crossing with warning lights', preL: 30, post: 10, gap: 30, hasBarrier: false };
+  }
+  if (b === 'gate' || b === 'gates' || b === 'lift_gate' || b === 'sliding_gate')
+    return { type: 'GATE', name: 'Gated crossing', preL: 150, preD: 130, post: 20, gap: 120, hasBarrier: true };
+  if (b === 'yes')
+    return { type: 'GEN', name: 'Barrier crossing (type unknown)', preL: 90, preD: 75, post: 15, gap: 60, hasBarrier: true };
+  return { type: 'GEN', name: 'Crossing type unknown', preL: 90, preD: 75, post: 15, gap: 60, hasBarrier: true, uncertain: true };
+}
 
 // ---------- boot ----------
 async function loadStations() {
@@ -236,15 +271,18 @@ out body;
 way(bn.x)["railway"];
 out body;`;
   let data = null, lastErr = null;
-  for (const ep of OVERPASS_ENDPOINTS) {
-    try {
-      const r = await fetch(ep, { method: 'POST', body: 'data=' + encodeURIComponent(q),
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        signal: AbortSignal.timeout(25000) });
-      if (!r.ok) { lastErr = new Error('Overpass HTTP ' + r.status); continue; }
-      data = await r.json();
-      break;
-    } catch (e) { lastErr = e; }
+  for (let round = 0; round < 2 && !data; round++) {
+    if (round) await new Promise(res => setTimeout(res, 2500));
+    for (const ep of OVERPASS_ENDPOINTS) {
+      try {
+        const r = await fetch(ep, { method: 'POST', body: 'data=' + encodeURIComponent(q),
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          signal: AbortSignal.timeout(25000) });
+        if (!r.ok) { lastErr = new Error('Overpass HTTP ' + r.status); console.warn(ep, r.status); continue; }
+        data = await r.json();
+        break;
+      } catch (e) { lastErr = e; console.warn(ep, e.message); }
+    }
   }
   if (!data) throw (lastErr || new Error('Overpass unreachable'));
   const nodes = data.elements.filter(e => e.type === 'node');
@@ -264,7 +302,12 @@ out body;`;
   const merged = [];
   for (const n of realNodes) {
     const twin = merged.find(m => havKm(m.lat, m.lon, n.lat, n.lon) < 0.15);
-    if (twin) { if (!twin.tags?.name && n.tags?.name) twin.tags = n.tags; continue; }
+    if (twin) {
+      // keep the better-tagged node's details when merging track twins
+      const tt = twin.tags || {}, nt = n.tags || {};
+      if ((!tt.name && nt.name) || (!tt['crossing:barrier'] && nt['crossing:barrier'])) twin.tags = { ...nt, ...tt };
+      continue;
+    }
     merged.push(n);
   }
   for (const n of merged) {
@@ -272,7 +315,7 @@ out body;`;
     const tags = n.tags || {};
     const name = tags.name || (road ? ((road.tags.name || road.tags.ref) + ' level crossing') : 'Level crossing');
     const c = { id: n.id, lat: n.lat, lon: n.lon, name,
-      barrier: BARRIER_LABELS[tags['crossing:barrier']] || null };
+      rawBarrier: tags['crossing:barrier'], rawLight: tags['crossing:light'] };
     crossings.set(n.id, c);
     const mk = L.marker([n.lat, n.lon], { icon: xingIcon(false) }).addTo(xingLayer);
     mk.on('click', () => selectCrossing(c, mk));
@@ -313,6 +356,26 @@ function betweenness(ax, ay, bx, by, xlat, xlon) {
   const detour = dA + dB - dAB;
   if (detour > 0.12 * dAB + 0.35) return null;  // not on this segment
   return { frac: dA / (dA + dB), dAB, detour };
+}
+
+// Accelerate-cruise-brake profile between two station stops (EMU-ish rates:
+// 0.45 m/s² up, 0.65 m/s² braking). Given segment length D (m), run time T (s)
+// and crossing offset d (m) from the departure stop, returns time to the
+// crossing (s) and the train's speed there (m/s). Falls back to proportional
+// scaling when the schedule is tighter than the physics allows (data noise).
+function kinematicPass(D, T, d) {
+  const a = 0.45, br = 0.65, k = 1 / (2 * a) + 1 / (2 * br);
+  const disc = T * T - 4 * k * D;
+  const v = disc >= 0 ? (T - Math.sqrt(disc)) / (2 * k) : Math.sqrt(D / k);
+  const da = v * v / (2 * a), db = v * v / (2 * br);
+  let t;
+  if (d <= da) t = Math.sqrt(2 * d / a);
+  else if (d <= D - db) t = v / a + (d - da) / v;
+  else t = (v / a + (D - da - db) / v + v / br) - Math.sqrt(2 * Math.max(0, D - d) / br);
+  const total = v / a + Math.max(0, D - da - db) / v + v / br;
+  if (total > 0) t = t * (T / total);           // stretch to match the timetable exactly
+  const vAt = Math.min(Math.sqrt(2 * a * d), v, Math.sqrt(Math.max(0.1, 2 * br * (D - d))));
+  return { t, v: vAt };
 }
 
 function timeOf(pt, nowM) {
@@ -359,7 +422,14 @@ function extractPasses(board, boardCrs, xing, nowM) {
       let dt = B.t.mins - A.t.mins;
       if (dt < 0) dt += 1440;
       if (dt > 90) continue;                        // implausible segment
-      const pass = A.t.mins + bw.frac * dt;
+      const D = bw.dAB * 1000, d = bw.frac * D;
+      const isFinal = i + 1 === chain.length - 1;
+      // intermediate calling-point times are departures, so the leg includes
+      // B's dwell — subtract a typical 35 s stop except into the terminus
+      let Tsec = dt * 60 - (isFinal ? 0 : 35);
+      Tsec = Math.max(Tsec, D / 55, 0.5 * dt * 60);
+      const kin = kinematicPass(D, Tsec, d);
+      const pass = A.t.mins + kin.t / 60;
       // key must be identical when the same train is seen from different boards:
       // Darwin service IDs are board-specific, but operator + destination + the
       // scheduled time at the final calling point are stable across boards.
@@ -367,6 +437,7 @@ function extractPasses(board, boardCrs, xing, nowM) {
       out.push({
         id: `${svc.operatorCode}|${last.crs}|${parseHM(last.tRaw, nowM) ?? ''}`,
         pass, segKm: bw.dAB, detour: bw.detour,
+        vx: kin.v, dToA: d,
         from: A.name, to: B.name,
         origin: (svc.origin || []).map(o => o.locationName).join(' & '),
         dest: (svc.destination || []).map(d => d.locationName).join(' & '),
@@ -401,6 +472,28 @@ async function computePasses(xing) {
   return { list, nowM, boards: okBoards, boardsTried: near.length, stations: near };
 }
 
+// Turn estimated passes into merged road-closure windows for this crossing.
+function computeClosures(list, prof, nowM) {
+  if (!prof.preL) return [];
+  const evs = list.map(p => {
+    let preL = prof.preL, post = prof.post;
+    // automatic crossings: strike-in is a fixed distance, so a slow train
+    // (stopping nearby) triggers the sequence disproportionately early
+    if ((prof.type === 'AHB' || prof.type === 'AOC') && p.vx < 15) preL += 15;
+    // signaller-worked barriers usually stay down through a station stop
+    // immediately before the crossing
+    if ((prof.type === 'MCB' || prof.type === 'GATE') && p.dToA < 1200) preL += 45;
+    return { s: p.pass - preL / 60, e: p.pass + post / 60, n: 1 };
+  }).sort((x, y) => x.s - y.s);
+  const out = [];
+  for (const ev of evs) {
+    const cur = out[out.length - 1];
+    if (cur && ev.s <= cur.e + prof.gap / 60) { cur.e = Math.max(cur.e, ev.e); cur.n += ev.n; }
+    else out.push({ ...ev });
+  }
+  return out.filter(w => w.e > nowM - 1);
+}
+
 // ---------- UI ----------
 async function selectCrossing(c, marker) {
   if (selMarker) selMarker.setIcon(xingIcon(false));
@@ -419,7 +512,7 @@ function renderPanelShell(c, inner) {
     <div class="toolbar">
       <div style="min-width:0">
         <div class="crossTitle">${esc(c.name)}</div>
-        <div class="crossSub">${c.barrier ? esc(c.barrier) + ' · ' : ''}${c.lat.toFixed(5)}, ${c.lon.toFixed(5)}</div>
+        <div class="crossSub">${esc(crossingProfile(c).name)} · ${c.lat.toFixed(5)}, ${c.lon.toFixed(5)}</div>
       </div>
       <div class="spacer"></div>
       <button class="pill" onclick="refreshSelected()">↻ Refresh</button>
@@ -441,7 +534,34 @@ async function refreshSelected() {
         (checked live boards at ${near.slice(0, boards).map(s => esc(s.stationName)).join(', ')}).
         Quiet lines, freight-only lines and heritage railways won't show scheduled passenger services.</p>`;
     } else {
-      html = list.map(p => {
+      const prof = crossingProfile(c);
+      const closures = computeClosures(list, prof, nowM);
+      const word = prof.hasBarrier ? 'Barriers' : 'Warning lights';
+      const cur = closures.find(w => w.s <= nowM && nowM <= w.e);
+      const next = closures.find(w => w.s > nowM);
+      if (prof.type === 'NONE') {
+        html += `<div class="banner st-none">No barriers or warning lights are mapped for this crossing —
+          take extra care and use the train times below.</div>`;
+      } else if (cur) {
+        html += `<div class="banner st-closed">🔴 Road likely closed — ${word.toLowerCase()} ${prof.hasBarrier ? 'down' : 'flashing'} until about ${fmtHM(cur.e)}
+          <div class="sub">${cur.n} train${cur.n === 1 ? '' : 's'} this closure${prof.uncertain ? ' · crossing type unknown, timings are a rough guess' : ''}</div></div>`;
+      } else if (next && next.s - nowM <= 3) {
+        html += `<div class="banner st-soon">🟠 Closing soon — ${word.toLowerCase()} from about ${fmtHM(next.s)} to ${fmtHM(next.e)}
+          <div class="sub">${next.n} train${next.n === 1 ? '' : 's'} · don't chance it on foot or in a queue</div></div>`;
+      } else if (next) {
+        html += `<div class="banner st-open">🟢 Likely open — next closure about ${fmtHM(next.s)} (in ${Math.round(next.s - nowM)} min)</div>`;
+      } else {
+        html += `<div class="banner st-open">🟢 Likely open — no closures expected in the next couple of hours</div>`;
+      }
+      if (closures.length && prof.type !== 'NONE') {
+        const total = Math.round(closures.reduce((s, w) => s + (w.e - w.s), 0));
+        html += `<div class="closures"><h3>Estimated ${word.toLowerCase()} closures · ~${total} min total ahead</h3>` +
+          closures.map(w => `<div class="closure">
+            <span class="range">${fmtHM(w.s)}–${fmtHM(w.e)}</span>
+            <span class="dur">≈${Math.max(1, Math.round(w.e - w.s))} min · ${w.n} train${w.n === 1 ? '' : 's'}</span>
+          </div>`).join('') + `</div><h3 style="font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:12px 0 0">Trains</h3>`;
+      }
+      html += list.map(p => {
         const inMin = Math.round(p.pass - nowM);
         const imminent = inMin <= 3;
         const whenBig = inMin <= 0 ? 'now' : (inMin < 60 ? `${inMin} min` : fmtHM(p.pass));
@@ -453,16 +573,12 @@ async function refreshSelected() {
           <div class="when"><div class="big">${esc(whenBig)}</div><div class="small">${p.uncertain ? '~' : ''}${fmtHM(p.pass)}</div></div>
           <div class="info">
             <div class="route">${esc(p.origin)} → ${esc(p.dest)}${badge}</div>
-            <div class="meta">${esc(p.operator)} · passes between ${esc(p.from)} and ${esc(p.to)}</div>
+            <div class="meta">${esc(p.operator)} · passes between ${esc(p.from)} and ${esc(p.to)} · ≈${Math.round(p.vx * 2.237)} mph here</div>
           </div>
         </div>`;
       }).join('');
     }
-    html += `<div class="caveat"><strong>Estimates only — never rely on this for safety.</strong>
-      Times are interpolated from live timings at nearby stations, so they can be a few minutes out,
-      and services that don't call at any nearby station (including freight) may be missing.
-      Always obey barriers, lights and signage at the crossing.
-      <br>Updated ${fmtHM(nowM)} · live boards: ${near.slice(0, 5).filter((s,i)=>i<boardsTried).map(s => esc(s.crsCode)).join(', ')}</div>`;
+    html += `<div class="hint" style="margin-top:10px">Updated ${fmtHM(nowM)} · live boards: ${near.slice(0, 5).filter((s,i)=>i<boardsTried).map(s => esc(s.crsCode)).join(', ')}</div>`;
     const el = $('trainList');
     if (el) el.innerHTML = html;
   } catch (e) {
@@ -534,7 +650,7 @@ async function searchArea() {
         : 'No level crossings mapped in this area. Try zooming out or another location.';
     }
   } catch (e) {
-    $('areaBtn').textContent = 'Find crossings in this area';
+    $('areaBtn').textContent = 'Search failed — tap to retry';
     if (!selected) $('bootStatus').innerHTML = 'Crossing search failed (' + esc(e.message) + '). Try again shortly.';
   }
 }
