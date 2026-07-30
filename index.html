@@ -162,6 +162,9 @@
 <script>
 'use strict';
 const HUXLEY = 'https://huxley2.azurewebsites.net';
+// Optional Network Rail TRUST bridge (see worker/README.md) — adds freight and
+// other non-passenger moves. Leave '' to disable.
+const TRUST_BRIDGE = 'https://levelx-trust-bridge.viralto.workers.dev';
 const OVERPASS_ENDPOINTS = [
   'https://overpass-api.de/api/interpreter',
   'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
@@ -179,6 +182,18 @@ let fetchSeq = 0;
 // ---------- helpers ----------
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function bearingDeg(lat1, lon1, lat2, lon2) {
+  const toR = Math.PI / 180;
+  const y = Math.sin((lon2 - lon1) * toR) * Math.cos(lat2 * toR);
+  const x = Math.cos(lat1 * toR) * Math.sin(lat2 * toR) -
+            Math.sin(lat1 * toR) * Math.cos(lat2 * toR) * Math.cos((lon2 - lon1) * toR);
+  return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+}
+
+function angDiff(a, b) {
+  return Math.abs(((a - b + 540) % 360) - 180);
+}
 
 function havKm(lat1, lon1, lat2, lon2) {
   const R = 6371, toR = Math.PI / 180;
@@ -202,6 +217,16 @@ function parseHM(s, ref) {
   while (t < ref - 720) t += 1440;
   while (t > ref + 720) t -= 1440;
   return t;
+}
+
+// epoch ms -> minutes since midnight UK, unwrapped near `ref`
+function epochToUkMins(ms, ref) {
+  const p = new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/London', hour: 'numeric', minute: 'numeric', hourCycle: 'h23' }).formatToParts(new Date(ms));
+  const g = t => +p.find(x => x.type === t).value;
+  let m = g('hour') * 60 + g('minute');
+  while (m < ref - 720) m += 1440;
+  while (m > ref + 720) m -= 1440;
+  return m;
 }
 
 function fmtHM(mins) {
@@ -269,7 +294,7 @@ node["railway"="level_crossing"](around:${Math.round(radiusM)},${lat},${lon})->.
 way(bn.x)["highway"];
 out body;
 way(bn.x)["railway"];
-out body;`;
+out geom;`;
   let data = null, lastErr = null;
   for (let round = 0; round < 2 && !data; round++) {
     if (round) await new Promise(res => setTimeout(res, 2500));
@@ -315,7 +340,8 @@ out body;`;
     const tags = n.tags || {};
     const name = tags.name || (road ? ((road.tags.name || road.tags.ref) + ' level crossing') : 'Level crossing');
     const c = { id: n.id, lat: n.lat, lon: n.lon, name,
-      rawBarrier: tags['crossing:barrier'], rawLight: tags['crossing:light'] };
+      rawBarrier: tags['crossing:barrier'], rawLight: tags['crossing:light'],
+      bearing: railBearingAt(n.id, railWays) };
     crossings.set(n.id, c);
     const mk = L.marker([n.lat, n.lon], { icon: xingIcon(false) }).addTo(xingLayer);
     mk.on('click', () => selectCrossing(c, mk));
@@ -335,6 +361,19 @@ function xingIcon(sel) {
     html: `<div class="xing-icon${sel ? ' sel' : ''}" style="width:22px;height:22px">✕</div>` });
 }
 
+// Undirected bearing (0-180°) of the track through a crossing node, from the
+// parent railway way's geometry (`out geom` includes node coordinates).
+function railBearingAt(nodeId, railWays) {
+  for (const w of railWays) {
+    const i = w.nodes ? w.nodes.indexOf(nodeId) : -1;
+    if (i < 0 || !w.geometry) continue;
+    const p = w.geometry[Math.max(0, i - 1)], q = w.geometry[Math.min(w.geometry.length - 1, i + 1)];
+    if (!p || !q || (p.lat === q.lat && p.lon === q.lon)) continue;
+    return bearingDeg(p.lat, p.lon, q.lat, q.lon) % 180;
+  }
+  return null;
+}
+
 // ---------- train pass estimation ----------
 function nearestStations(lat, lon, n) {
   return stations
@@ -345,6 +384,31 @@ function nearestStations(lat, lon, n) {
 
 function stationByCrs(crs) {
   return stations.find(s => s.crsCode === crs);
+}
+
+// Boards to fetch for a crossing: the 5 nearest stations, plus up to 2 further
+// stations in each direction along the railway line — expresses skip the local
+// stops but appear (with calling points bracketing the crossing) on the boards
+// of the bigger stations they do call at further down the line.
+function boardStations(xing) {
+  const all = stations
+    .map(s => ({ ...s, d: havKm(xing.lat, xing.lon, s.lat, s.long) }))
+    .sort((a, b) => a.d - b.d);
+  const picks = all.slice(0, 5).filter(s => s.d < 40);
+  if (xing.bearing != null) {
+    for (const dir of [0, 180]) {
+      let added = 0;
+      for (const s of all) {
+        if (added >= 2) break;
+        if (s.d < 5 || s.d > 60) continue;
+        if (picks.some(p => p.crsCode === s.crsCode)) continue;
+        if (angDiff(bearingDeg(xing.lat, xing.lon, s.lat, s.long), xing.bearing + dir) <= 25) {
+          picks.push(s); added++;
+        }
+      }
+    }
+  }
+  return picks.slice(0, 9);
 }
 
 // Does crossing X lie between points A and B along a (roughly straight) railway?
@@ -451,14 +515,67 @@ function extractPasses(board, boardCrs, xing, nowM) {
   return out;
 }
 
+// Freight & other non-passenger moves from the TRUST bridge. TRUST reports
+// actual times as trains pass stations, but future timings need the schedule —
+// so this dead-reckons: speed from the train's last two station reports,
+// projected along its direction of travel to the crossing.
+function ingestTrustEvents(events, xing, nowM) {
+  const out = [];
+  const byTrain = new Map();
+  for (const ev of events) {
+    if (!byTrain.has(ev.train_id)) byTrain.set(ev.train_id, []);
+    byTrain.get(ev.train_id).push(ev);
+  }
+  for (const [trainId, evs] of byTrain) {
+    const cls = (trainId || '')[2];                  // headcode class digit
+    if (!cls || '129'.includes(cls)) continue;       // passenger — Darwin covers it
+    evs.sort((a, b) => a.actual - b.actual);
+    // last two reports at distinct stations with known coordinates
+    const pts = [];
+    for (let i = evs.length - 1; i >= 0 && pts.length < 2; i--) {
+      const st = stationByCrs(evs[i].crs);
+      if (!st) continue;
+      if (pts.length && pts[0].crs === evs[i].crs) continue;
+      pts.unshift({ ...evs[i], lat: st.lat, lon: st.long, name: st.stationName });
+    }
+    if (pts.length < 2) continue;
+    const [P, Q] = pts;                              // P earlier, Q latest
+    const dtSec = (Q.actual - P.actual) / 1000;
+    if (dtSec < 30 || Q.actual < Date.now() - 45 * 60 * 1000) continue;
+    const dPQ = havKm(P.lat, P.lon, Q.lat, Q.lon) * 1000;
+    const v = dPQ / dtSec;
+    if (v < 4 || v > 60) continue;                   // implausible for dead-reckoning
+    const dQX = havKm(Q.lat, Q.lon, xing.lat, xing.lon) * 1000;
+    if (dQX > 40000) continue;
+    if (angDiff(bearingDeg(Q.lat, Q.lon, xing.lat, xing.lon),
+                bearingDeg(P.lat, P.lon, Q.lat, Q.lon)) > 50) continue;  // not heading this way
+    const pass = epochToUkMins(Q.actual, nowM) + dQX / v / 60;
+    out.push({
+      id: 'trust|' + trainId,
+      pass, vx: v, dToA: dQX, segKm: dPQ / 1000,
+      freight: true, headcode: Q.headcode || trainId.slice(2, 6), toc: Q.toc,
+      lastSeen: { name: Q.name, at: epochToUkMins(Q.actual, nowM) },
+      delayed: (Q.late_min || 0) > 2, uncertain: true,
+    });
+  }
+  return out;
+}
+
 async function computePasses(xing) {
-  const near = nearestStations(xing.lat, xing.lon, 5).filter(s => s.d < 40);
+  const near = boardStations(xing);
   const nowM = ukNowMins();
-  const results = await Promise.allSettled(near.map(s => fetchBoard(s.crsCode)));
+  const bridge = (typeof window !== 'undefined' && window.TRUST_BRIDGE_OVERRIDE) || TRUST_BRIDGE;
+  const jobs = near.map(s => fetchBoard(s.crsCode));
+  if (bridge) jobs.push(
+    fetch(`${bridge}/movements?crs=${near.map(s => s.crsCode).join(',')}&mins=60`,
+          { signal: AbortSignal.timeout(15000) }).then(r => r.json()));
+  const results = await Promise.allSettled(jobs);
   let passes = [];
-  let okBoards = 0;
+  let okBoards = 0, freightOk = false;
   results.forEach((res, i) => {
-    if (res.status === 'fulfilled') { okBoards++; passes = passes.concat(extractPasses(res.value, near[i].crsCode, xing, nowM)); }
+    if (res.status !== 'fulfilled') return;
+    if (i < near.length) { okBoards++; passes = passes.concat(extractPasses(res.value, near[i].crsCode, xing, nowM)); }
+    else { freightOk = true; passes = passes.concat(ingestTrustEvents(res.value.events || [], xing, nowM)); }
   });
   // dedupe same service seen from several boards — keep tightest bracketing segment
   const best = new Map();
@@ -467,9 +584,22 @@ async function computePasses(xing) {
     if (!cur || p.segKm < cur.segKm) best.set(p.id, p);
   }
   const list = [...best.values()]
-    .filter(p => p.pass >= nowM - 3)
+    .filter(p => p.pass >= nowM - 3 && p.pass <= nowM + 120)
     .sort((a, b) => a.pass - b.pass);
-  return { list, nowM, boards: okBoards, boardsTried: near.length, stations: near };
+  // S-class learner: report our pass estimates (they're the correlation key the
+  // bridge uses to identify this crossing's signalling bit) and read back any
+  // learned live barrier state. Both are best-effort.
+  let live = null;
+  if (bridge) {
+    const epochs = list.map(p => Date.now() + (p.pass - nowM) * 60000);
+    fetch(`${bridge}/observe`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: xing.id, passes: epochs }) }).catch(() => {});
+    try {
+      live = await (await fetch(`${bridge}/crossing-state?id=${xing.id}`,
+        { signal: AbortSignal.timeout(8000) })).json();
+    } catch (e) {}
+  }
+  return { list, nowM, boards: okBoards, boardsTried: near.length, stations: near, freightOk, live };
 }
 
 // Turn estimated passes into merged road-closure windows for this crossing.
@@ -524,14 +654,14 @@ async function refreshSelected() {
   if (!selected) return;
   const c = selected, seq = ++fetchSeq;
   try {
-    const { list, nowM, boards, boardsTried, stations: near } = await computePasses(c);
+    const { list, nowM, boards, boardsTried, stations: near, live } = await computePasses(c);
     if (seq !== fetchSeq || selected !== c) return;   // stale response
     let html = '';
     if (!boards) {
       html = `<p class="hint">Couldn't reach the live departures service. Check your connection and try again.</p>`;
     } else if (!list.length) {
       html = `<p class="hint">No trains found passing this crossing in the next couple of hours
-        (checked live boards at ${near.slice(0, boards).map(s => esc(s.stationName)).join(', ')}).
+        (checked live boards at ${near.map(s => esc(s.stationName)).join(', ')}).
         Quiet lines, freight-only lines and heritage railways won't show scheduled passenger services.</p>`;
     } else {
       const prof = crossingProfile(c);
@@ -553,6 +683,17 @@ async function refreshSelected() {
       } else {
         html += `<div class="banner st-open">🟢 Likely open — no closures expected in the next couple of hours</div>`;
       }
+      // Confirmed state from live signalling, once the bridge has learned this
+      // crossing's S-class bit. Shown alongside the estimate, never instead.
+      if (live?.learned && live.state) {
+        const ago = live.lastChangeSec != null
+          ? (live.lastChangeSec < 120 ? `${live.lastChangeSec} s ago` : `${Math.round(live.lastChangeSec / 60)} min ago`) : '';
+        html += live.state === 'closed'
+          ? `<div class="banner st-closed">📡 Live signalling: ${word.toLowerCase()} confirmed ${prof.hasBarrier ? 'DOWN' : 'ON'}${ago ? ` (since ${ago})` : ''}
+              <div class="sub">self-calibrated from ${live.samples} observed closures · confidence ${Math.round(live.confidence * 100)}%</div></div>`
+          : `<div class="banner st-open">📡 Live signalling: ${word.toLowerCase()} confirmed ${prof.hasBarrier ? 'up' : 'off'}${ago ? ` (since ${ago})` : ''}
+              <div class="sub">self-calibrated from ${live.samples} observed closures · confidence ${Math.round(live.confidence * 100)}%</div></div>`;
+      }
       if (closures.length && prof.type !== 'NONE') {
         // round each window's endpoints once, then derive both the displayed
         // range and its duration from those, so the columns always agree
@@ -572,6 +713,17 @@ async function refreshSelected() {
         const inMin = Math.round(p.pass - nowM);
         const imminent = inMin <= 3;
         const whenBig = inMin <= 0 ? 'now' : (inMin < 60 ? `${inMin} min` : fmtHM(p.pass));
+        if (p.freight) {
+          const CLS = { 0: 'light locomotive', 3: 'parcels / ECS', 4: 'freight', 5: 'empty stock',
+                        6: 'freight', 7: 'freight', 8: 'freight' };
+          return `<div class="train${imminent ? ' imminent' : ''}">
+            <div class="when"><div class="big">${esc(whenBig)}</div><div class="small">~${fmtHM(p.pass)}</div></div>
+            <div class="info">
+              <div class="route">${esc(p.headcode)} — ${esc(CLS[p.headcode[0]] || 'non-passenger')}<span class="badge b-warn">live estimate</span></div>
+              <div class="meta">Network Rail TRUST · passed ${esc(p.lastSeen.name)} at ${fmtHM(p.lastSeen.at)} · ≈${Math.round(p.vx * 2.237)} mph</div>
+            </div>
+          </div>`;
+        }
         let badge = '';
         if (p.uncertain) badge = `<span class="badge b-bad">delayed</span>`;
         else if (p.delayed) badge = `<span class="badge b-warn">running late</span>`;
@@ -585,7 +737,7 @@ async function refreshSelected() {
         </div>`;
       }).join('');
     }
-    html += `<div class="hint" style="margin-top:10px">Updated ${fmtHM(nowM)} · live boards: ${near.slice(0, 5).filter((s,i)=>i<boardsTried).map(s => esc(s.crsCode)).join(', ')}</div>`;
+    html += `<div class="hint" style="margin-top:10px">Updated ${fmtHM(nowM)} · live boards: ${near.map(s => esc(s.crsCode)).join(', ')}</div>`;
     const el = $('trainList');
     if (el) el.innerHTML = html;
   } catch (e) {
