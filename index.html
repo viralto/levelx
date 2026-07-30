@@ -554,11 +554,18 @@ async function refreshSelected() {
         html += `<div class="banner st-open">🟢 Likely open — no closures expected in the next couple of hours</div>`;
       }
       if (closures.length && prof.type !== 'NONE') {
-        const total = Math.round(closures.reduce((s, w) => s + (w.e - w.s), 0));
-        html += `<div class="closures"><h3>Estimated ${word.toLowerCase()} closures · ~${total} min total ahead</h3>` +
-          closures.map(w => `<div class="closure">
-            <span class="range">${fmtHM(w.s)}–${fmtHM(w.e)}</span>
-            <span class="dur">≈${Math.max(1, Math.round(w.e - w.s))} min · ${w.n} train${w.n === 1 ? '' : 's'}</span>
+        // round each window's endpoints once, then derive both the displayed
+        // range and its duration from those, so the columns always agree
+        const rows = closures.map(w => {
+          const rs = Math.round(w.s), re = Math.max(Math.round(w.e), rs + 1);
+          return { rs, re, dur: re - rs, n: w.n };
+        });
+        const total = rows.reduce((s, r) => s + r.dur, 0);
+        const noun = prof.hasBarrier ? 'barrier closures' : 'warning-light periods';
+        html += `<div class="closures"><h3>Estimated ${noun} · ~${total} min total ahead</h3>` +
+          rows.map(r => `<div class="closure">
+            <span class="range">${fmtHM(r.rs)}–${fmtHM(r.re)}</span>
+            <span class="dur">≈${r.dur} min · ${r.n} train${r.n === 1 ? '' : 's'}</span>
           </div>`).join('') + `</div><h3 style="font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:12px 0 0">Trains</h3>`;
       }
       html += list.map(p => {
